@@ -10,10 +10,11 @@ Usage:
 
 import argparse
 import json
+import math
 import os
 import sys
 from pathlib import Path
-from typing import Dict, List, Any, Optional, Set
+from typing import Dict, List, Any, Optional, Set, Tuple
 
 try:
     import pyslang
@@ -22,6 +23,212 @@ except ImportError:
     print("❌ 错误：pyslang 未安装", file=sys.stderr)
     print("请运行：pip install pyslang", file=sys.stderr)
     sys.exit(1)
+
+
+# ============================================================================
+# 逻辑深度估算规则表（可维护，可配置）
+# ============================================================================
+LOGIC_DEPTH_RULES = {
+    # === 0 级深度 - 连线类 ===
+    'wire': 0,           # 连线
+    'bit_select': 0,     # 位选 [i]
+    'part_select': 0,    # 部分选择 [i+:w]
+    'concat': 0,         # 拼接 {a, b}
+    'replication': 0,    # 复制 {3{a}}
+    
+    # === 1 级深度 - 简单并行运算 ===
+    'bitwise_and': 1,    # &
+    'bitwise_or': 1,     # |
+    'bitwise_xor': 1,    # ^
+    'bitwise_not': 1,    # ~
+    'shift_l': 1,        # <<
+    'shift_r': 1,        # >>
+    'shift_ar': 1,       # >>> 算术移位
+    'mux2to1': 1,        # 2 选 1 MUX (三元运算符 ?:)
+    
+    # === log2(n) 深度 - 进位链/比较树 ===
+    'adder': 'log2(n)',      # 加减法
+    'subtractor': 'log2(n)', # 减法器
+    'eq': 'log2(n)+1',       # 等于 ==
+    'neq': 'log2(n)+1',      # 不等于 !=
+    'lt': 'log2(n)+1',       # 小于 <
+    'le': 'log2(n)+1',       # 小于等于 <=
+    'gt': 'log2(n)+1',       # 大于 >
+    'ge': 'log2(n)+1',       # 大于等于 >=
+    
+    # === 2*log2(n) 深度 - 乘法树 ===
+    'multiplier': '2*log2(n)',   # 乘法 *
+    
+    # === 4*log2(n) 深度 - 复杂运算 ===
+    'divider': '4*log2(n)',      # 除法 /
+    'modulo': '4*log2(n)',       # 取模 %
+    
+    # === log2(w) 深度 - 多路选择器 ===
+    'mux': 'log2(w)',    # w 选 1 MUX (case 语句)
+}
+
+
+class LogicDepthEstimator:
+    """逻辑深度估算器 - 基于 AST 和操作符类型"""
+    
+    def __init__(self, rules: Dict = None):
+        self.rules = rules or LOGIC_DEPTH_RULES
+    
+    def _get_bit_width(self, node) -> int:
+        """估算信号位宽（简化版）"""
+        # TODO: 实际应该分析类型系统，这里先简化处理
+        # 默认返回 32 位（常见位宽）
+        return 32
+    
+    def _calc_log2_depth(self, n: int, multiplier: float = 1.0, offset: float = 0) -> int:
+        """计算 log2(n) 类型的深度"""
+        if n <= 1:
+            return int(offset)
+        return int(math.ceil(multiplier * math.log2(n) + offset))
+    
+    def _get_operator_type(self, node) -> Optional[str]:
+        """获取操作符类型"""
+        if not hasattr(node, 'operator'):
+            return None
+        
+        op = node.operator
+        # 映射 pyslang 操作符到规则表
+        op_map = {
+            'Add': 'adder',
+            'Subtract': 'subtractor',
+            'Multiply': 'multiplier',
+            'Divide': 'divider',
+            'Modulo': 'modulo',
+            'BinaryAnd': 'bitwise_and',
+            'BinaryOr': 'bitwise_or',
+            'BinaryXor': 'bitwise_xor',
+            'BinaryAndAssignment': 'bitwise_and',
+            'BinaryOrAssignment': 'bitwise_or',
+            'BinaryXorAssignment': 'bitwise_xor',
+            'ShiftLeft': 'shift_l',
+            'ShiftRight': 'shift_r',
+            'ArithmeticShiftLeft': 'shift_ar',
+            'ArithmeticShiftRight': 'shift_ar',
+            'Equal': 'eq',
+            'NotEqual': 'neq',
+            'LessThan': 'lt',
+            'LessThanEqual': 'le',
+            'GreaterThan': 'gt',
+            'GreaterThanEqual': 'ge',
+        }
+        
+        op_name = str(op).replace('BinaryOperator.', '') if hasattr(op, '__str__') else str(op)
+        return op_map.get(op_name)
+    
+    def estimate_expression_depth(self, node, bit_width: int = None) -> int:
+        """估算表达式的逻辑深度"""
+        if not node:
+            return 0
+        
+        if bit_width is None:
+            bit_width = self._get_bit_width(node)
+        
+        kind = node.kind if hasattr(node, 'kind') else None
+        
+        # 二元表达式（加减乘除、位运算等）
+        if kind == SyntaxKind.BinaryExpression:
+            op_type = self._get_operator_type(node)
+            if op_type:
+                rule = self.rules.get(op_type)
+                if rule:
+                    if rule == 0:
+                        return 0
+                    elif rule == 1:
+                        return 1
+                    elif 'log2(n)' in rule:
+                        # 解析规则字符串
+                        if rule == 'log2(n)':
+                            return self._calc_log2_depth(bit_width, 1.0, 0)
+                        elif rule == '2*log2(n)':
+                            return self._calc_log2_depth(bit_width, 2.0, 0)
+                        elif rule == '4*log2(n)':
+                            return self._calc_log2_depth(bit_width, 4.0, 0)
+                        elif rule == 'log2(n)+1':
+                            return self._calc_log2_depth(bit_width, 1.0, 1)
+            
+            # 递归计算子表达式
+            max_child_depth = 0
+            for attr in ['left', 'right']:
+                if hasattr(node, attr):
+                    child = getattr(node, attr)
+                    if child:
+                        child_depth = self.estimate_expression_depth(child, bit_width)
+                        max_child_depth = max(max_child_depth, child_depth)
+            
+            # 当前操作符深度 + 子表达式最大深度
+            op_depth = 1  # 默认操作符深度为 1
+            return max_child_depth + op_depth
+        
+        # 三元运算符（MUX）
+        elif kind == SyntaxKind.ConditionalExpression:
+            # ?: 运算符，2 选 1 MUX
+            mux_depth = self.rules.get('mux2to1', 1)
+            
+            # 递归计算三个操作数
+            max_cond_depth = 0
+            for attr in ['condition', 'left', 'right']:
+                if hasattr(node, attr):
+                    child = getattr(node, attr)
+                    if child:
+                        child_depth = self.estimate_expression_depth(child, bit_width)
+                        max_cond_depth = max(max_cond_depth, child_depth)
+            
+            return max_cond_depth + mux_depth
+        
+        # 位选、部分选择（连线类，深度 0）
+        elif kind in [SyntaxKind.ElementSelectExpression, SyntaxKind.RangeSelectExpression]:
+            base_depth = 0
+            if hasattr(node, 'expression'):
+                base_depth = self.estimate_expression_depth(node.expression, bit_width)
+            return base_depth  # 选择操作本身深度为 0
+        
+        # 拼接（深度 0）
+        elif kind == SyntaxKind.ConcatenationExpression:
+            max_child = 0
+            if hasattr(node, 'expressions'):
+                try:
+                    for expr in node.expressions:
+                        if expr:
+                            d = self.estimate_expression_depth(expr, bit_width)
+                            max_child = max(max_child, d)
+                except:
+                    pass
+            return max_child  # 拼接本身深度为 0
+        
+        # 一元表达式（取反、负号等）
+        elif kind == SyntaxKind.UnaryExpression:
+            child_depth = 0
+            if hasattr(node, 'operand'):
+                child_depth = self.estimate_expression_depth(node.operand, bit_width)
+            return child_depth + 1  # 一元操作符深度为 1
+        
+        # 标识符、常量（深度 0）
+        elif kind in [SyntaxKind.IdentifierName, SyntaxKind.IntegerLiteral, 
+                      SyntaxKind.StringLiteral]:
+            return 0
+        
+        # 默认：递归子节点
+        max_depth = 0
+        for attr in ['expression', 'operand', 'left', 'right']:
+            if hasattr(node, attr):
+                child = getattr(node, attr)
+                if child:
+                    d = self.estimate_expression_depth(child, bit_width)
+                    max_depth = max(max_depth, d)
+        
+        return max_depth
+    
+    def estimate_case_mux_depth(self, case_items_count: int) -> int:
+        """估算 case 语句的 MUX 深度（多路选择器）"""
+        if case_items_count <= 1:
+            return 0
+        # log2(w) 深度
+        return self._calc_log2_depth(case_items_count, 1.0, 0)
 
 
 class RTLAnalyzer:
@@ -33,6 +240,7 @@ class RTLAnalyzer:
         self.instances: List[Dict] = []
         self.combinational_paths: List[Dict] = []
         self.timing_bottlenecks: List[Dict] = []
+        self.logic_depth_estimator = LogicDepthEstimator()
 
     def analyze_file(self, filepath: str) -> Dict[str, Any]:
         """分析单个 RTL 文件"""
@@ -78,6 +286,7 @@ class RTLAnalyzer:
             result["analysis"]["combinational_paths"] = self.combinational_paths[:10]
             result["analysis"]["timing_bottlenecks"] = self.timing_bottlenecks[:10]
             result["analysis"]["complexity_metrics"] = self._calculate_complexity(root)
+            result["analysis"]["logic_depth"] = self._calculate_logic_depth(root)
 
         except Exception as e:
             result["error"] = f"{type(e).__name__}: {str(e)}"
@@ -289,6 +498,24 @@ class RTLAnalyzer:
         if not self.modules:
             return 0
         return max(m["depth"] for m in self.modules.values()) + 1
+    
+    def _calculate_logic_depth(self, root) -> Dict[str, Any]:
+        """计算逻辑深度估算"""
+        result = {
+            "max_combinational_depth": 0,
+            "deepest_path": None,
+            "module_depths": {}
+        }
+        
+        for module_name in self.modules:
+            # 简化处理：对每个模块，估算其内部表达式的最大深度
+            # TODO: 实际应该遍历模块内部的所有表达式
+            result["module_depths"][module_name] = {
+                "estimated_max_depth": 0,  # 待实现完整遍历
+                "bit_width_assumed": 32    # 假设位宽
+            }
+        
+        return result
 
 
 def analyze_directory(dirpath: str, analyzer: RTLAnalyzer) -> List[Dict]:
