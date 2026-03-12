@@ -165,11 +165,11 @@ class RTLAnalyzer:
         elif kind == SyntaxKind.CaseStatement:
             location = self._get_location(node)
             items = self._count_case_items(node)
-            if items > 8:
+            if items > 128:
                 self.timing_bottlenecks.append({
                     "location": location,
                     "type": "large_case_statement",
-                    "severity": "high" if items > 16 else "medium",
+                    "severity": "high" if items > 256 else "warning",
                     "suggestion": f"case 语句有 {items} 个分支，考虑使用编码优化或流水线",
                     "details": f"分支数：{items}"
                 })
