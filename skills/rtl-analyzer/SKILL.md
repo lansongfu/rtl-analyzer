@@ -34,6 +34,79 @@
 - systemverilog 分析
 - 代码复杂度
 
+---
+
+## 🤖 AI Agent 调用指南
+
+### 方式 1：识别触发词自动调用
+
+当用户消息包含触发词时，AI Agent 应：
+1. 提取 RTL 文件路径（如未提供则询问）
+2. 执行命令：`python3 rtl_analyzer.py <文件路径> [-o 输出.json]`
+3. 解析 JSON 结果并返回摘要
+
+**示例对话：**
+```
+用户："帮我分析一下这个 RTL 代码的复杂度"
+AI："好的，请提供 RTL 文件路径"
+用户："./design.sv"
+AI：执行命令 → 返回摘要
+```
+
+### 方式 2：直接命令行调用
+
+```bash
+# 任何 AI agent 都可以执行
+cd /root/.openclaw/workspace/skills/rtl-analyzer
+python3 rtl_analyzer.py <RTL 文件路径> [-o 输出.json]
+```
+
+### 方式 3：Python API 集成
+
+```python
+from rtl_analyzer import RTLAnalyzer
+
+def analyze_rtl(filepath: str) -> dict:
+    """分析 RTL 文件"""
+    analyzer = RTLAnalyzer()
+    result = analyzer.analyze_file(filepath)
+    return result['analysis']
+
+# 使用示例
+report = analyze_rtl('design.sv')
+print(f"模块数：{report['module_count']}")
+print(f"if 嵌套热点：{len(report['combinational_paths'])}")
+```
+
+### 方式 4：CI/CD 集成
+
+```yaml
+# GitHub Actions 示例
+- name: RTL Analysis
+  run: |
+    pip install pyslang
+    python3 rtl_analyzer.py ./src/rtl/ -o report.json
+```
+
+---
+
+## 📋 输出解读指南
+
+### 关键指标阈值
+
+| 指标 | 正常 | 警告 | 危险 |
+|------|------|------|------|
+| if 嵌套深度 | ≤3 | 4-5 | >5 |
+| case 分支数 | ≤128 | 129-256 | >256 |
+| 逻辑深度 | ≤5 | 6-10 | >10 |
+| 环路复杂度 | ≤10 | 11-20 | >20 |
+
+### 典型建议话术
+
+- **if 嵌套过深：** "第 X 行 if 嵌套 Y 层，建议拆分为多个小函数或使用状态机"
+- **case 分支过多：** "case 语句有 X 个分支，考虑使用独热编码或优先级编码优化"
+- **逻辑深度过大：** "组合逻辑路径过长（X 级），建议插入流水线寄存器"
+
 ## 安装
 
 ```bash
