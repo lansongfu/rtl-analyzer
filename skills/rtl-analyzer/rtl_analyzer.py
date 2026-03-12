@@ -73,18 +73,182 @@ class LogicDepthEstimator:
     
     def __init__(self, rules: Dict = None):
         self.rules = rules or LOGIC_DEPTH_RULES
-    
-    def _get_bit_width(self, node) -> int:
-        """估算信号位宽（简化版）"""
-        # TODO: 实际应该分析类型系统，这里先简化处理
-        # 默认返回 32 位（常见位宽）
-        return 32
+        self._signal_widths: Dict[str, int] = {}  # 信号位宽缓存
     
     def _calc_log2_depth(self, n: int, multiplier: float = 1.0, offset: float = 0) -> int:
         """计算 log2(n) 类型的深度"""
         if n <= 1:
             return int(offset)
         return int(math.ceil(multiplier * math.log2(n) + offset))
+    
+    def _get_bit_width_from_type(self, type_node) -> int:
+        """从类型节点提取位宽"""
+        if not type_node:
+            return 32  # 默认 32 位
+        
+        # 检查是否是向量类型 (logic [7:0])
+        if hasattr(type_node, 'range'):
+            range_node = type_node.range
+            if range_node:
+                # 尝试从 range 提取位宽
+                if hasattr(range_node, 'left') and hasattr(range_node, 'right'):
+                    try:
+                        left = self._eval_constant(range_node.left)
+                        right = self._eval_constant(range_node.right)
+                        if left is not None and right is not None:
+                            return abs(left - right) + 1
+                    except:
+                        pass
+                return 32
+        
+        # 检查是否是 packed array
+        if hasattr(type_node, 'dimensions'):
+            dims = type_node.dimensions
+            if dims:
+                try:
+                    total = 1
+                    for dim in dims:
+                        if hasattr(dim, 'range'):
+                            r = dim.range
+                            if hasattr(r, 'left') and hasattr(r, 'right'):
+                                l = self._eval_constant(r.left)
+                                r_val = self._eval_constant(r.right)
+                                if l is not None and r_val is not None:
+                                    total *= abs(l - r_val) + 1
+                    return total
+                except:
+                    pass
+        
+        return 32
+    
+    def _eval_constant(self, node) -> Optional[int]:
+        """尝试计算常量表达式的值"""
+        if not node:
+            return None
+        
+        kind = node.kind if hasattr(node, 'kind') else None
+        
+        # 整数常量
+        if kind == SyntaxKind.IntegerLiteral:
+            try:
+                if hasattr(node, 'value'):
+                    return int(node.value)
+            except:
+                pass
+            # 尝试从文本解析
+            if hasattr(node, 'text'):
+                try:
+                    text = str(node.text).strip()
+                    # 处理带位宽的常量：8'd255, 4'b1010
+                    if "'" in text:
+                        parts = text.split("'")
+                        if len(parts) == 2:
+                            val_part = parts[1]
+                            if val_part.startswith('b'):
+                                return int(val_part[1:], 2)
+                            elif val_part.startswith('h'):
+                                return int(val_part[1:], 16)
+                            elif val_part.startswith('o'):
+                                return int(val_part[1:], 8)
+                            else:
+                                return int(val_part)
+                    return int(text)
+                except:
+                    pass
+            return None
+        
+        # 一元表达式（如 -5, ~3）
+        if kind == SyntaxKind.UnaryExpression:
+            if hasattr(node, 'operand'):
+                val = self._eval_constant(node.operand)
+                if val is not None:
+                    op = node.operator if hasattr(node, 'operator') else None
+                    if op and 'Minus' in str(op):
+                        return -val
+                    return val
+        
+        # 二元表达式（如 8-1, 2+3）
+        if kind == SyntaxKind.BinaryExpression:
+            left = self._eval_constant(getattr(node, 'left', None))
+            right = self._eval_constant(getattr(node, 'right', None))
+            if left is not None and right is not None:
+                op = node.operator if hasattr(node, 'operator') else None
+                op_str = str(op) if op else ''
+                try:
+                    if 'Add' in op_str:
+                        return left + right
+                    elif 'Subtract' in op_str:
+                        return left - right
+                    elif 'Multiply' in op_str:
+                        return left * right
+                    elif 'Divide' in op_str:
+                        return left // right if right != 0 else None
+                except:
+                    pass
+        
+        return None
+    
+    def _infer_signal_width(self, node, context_depth: int = 0) -> int:
+        """推断信号位宽"""
+        if not node or context_depth > 10:
+            return 32
+        
+        kind = node.kind if hasattr(node, 'kind') else None
+        
+        # 标识符 - 查找已知的位宽
+        if kind == SyntaxKind.IdentifierName:
+            if hasattr(node, 'text'):
+                name = str(node.text).strip()
+                if name in self._signal_widths:
+                    return self._signal_widths[name]
+            return 32  # 未知信号默认 32 位
+        
+        # 常量 - 从值推断位宽
+        if kind == SyntaxKind.IntegerLiteral:
+            val = self._eval_constant(node)
+            if val is not None:
+                if val == 0:
+                    return 1
+                return val.bit_length()
+            return 32
+        
+        # 位选 - 从选择范围推断
+        if kind == SyntaxKind.RangeSelectExpression:
+            if hasattr(node, 'left') and hasattr(node, 'right'):
+                left = self._eval_constant(node.left)
+                right = self._eval_constant(node.right)
+                if left is not None and right is not None:
+                    return abs(left - right) + 1
+            return 1
+        
+        # 拼接 - 位宽是各部分之和
+        if kind == SyntaxKind.ConcatenationExpression:
+            total = 0
+            if hasattr(node, 'expressions'):
+                try:
+                    for expr in node.expressions:
+                        if expr:
+                            total += self._infer_signal_width(expr, context_depth + 1)
+                except:
+                    pass
+            return max(total, 1)
+        
+        # 一元表达式 - 位宽不变
+        if kind == SyntaxKind.UnaryExpression:
+            if hasattr(node, 'operand'):
+                return self._infer_signal_width(node.operand, context_depth + 1)
+        
+        # 二元表达式 - 位宽取两边最大值
+        if kind == SyntaxKind.BinaryExpression:
+            left_width = 0
+            right_width = 0
+            if hasattr(node, 'left'):
+                left_width = self._infer_signal_width(node.left, context_depth + 1)
+            if hasattr(node, 'right'):
+                right_width = self._infer_signal_width(node.right, context_depth + 1)
+            return max(left_width, right_width, 1)
+        
+        return 32
     
     def _get_operator_type(self, node) -> Optional[str]:
         """获取操作符类型"""
@@ -120,97 +284,106 @@ class LogicDepthEstimator:
         op_name = str(op).replace('BinaryOperator.', '') if hasattr(op, '__str__') else str(op)
         return op_map.get(op_name)
     
-    def estimate_expression_depth(self, node, bit_width: int = None) -> int:
-        """估算表达式的逻辑深度"""
+    def estimate_expression_depth(self, node, bit_width: int = None) -> Tuple[int, int]:
+        """
+        估算表达式的逻辑深度
+        返回：(depth, bit_width)
+        """
         if not node:
-            return 0
-        
-        if bit_width is None:
-            bit_width = self._get_bit_width(node)
+            return (0, 32)
         
         kind = node.kind if hasattr(node, 'kind') else None
+        
+        # 先推断位宽
+        if bit_width is None:
+            bit_width = self._infer_signal_width(node)
         
         # 二元表达式（加减乘除、位运算等）
         if kind == SyntaxKind.BinaryExpression:
             op_type = self._get_operator_type(node)
+            
+            # 递归计算子表达式
+            left_depth, left_width = self.estimate_expression_depth(getattr(node, 'left', None))
+            right_depth, right_width = self.estimate_expression_depth(getattr(node, 'right', None))
+            max_child_depth = max(left_depth, right_depth)
+            result_width = max(left_width, right_width)
+            
             if op_type:
                 rule = self.rules.get(op_type)
                 if rule:
-                    if rule == 0:
-                        return 0
-                    elif rule == 1:
-                        return 1
+                    if isinstance(rule, int):
+                        # 固定深度（0 或 1）
+                        return (max_child_depth + rule, result_width)
                     elif 'log2(n)' in rule:
-                        # 解析规则字符串
+                        # 基于位宽的深度
                         if rule == 'log2(n)':
-                            return self._calc_log2_depth(bit_width, 1.0, 0)
+                            op_depth = self._calc_log2_depth(result_width, 1.0, 0)
                         elif rule == '2*log2(n)':
-                            return self._calc_log2_depth(bit_width, 2.0, 0)
+                            op_depth = self._calc_log2_depth(result_width, 2.0, 0)
                         elif rule == '4*log2(n)':
-                            return self._calc_log2_depth(bit_width, 4.0, 0)
+                            op_depth = self._calc_log2_depth(result_width, 4.0, 0)
                         elif rule == 'log2(n)+1':
-                            return self._calc_log2_depth(bit_width, 1.0, 1)
+                            op_depth = self._calc_log2_depth(result_width, 1.0, 1)
+                        else:
+                            op_depth = 1
+                        return (max_child_depth + op_depth, result_width)
             
-            # 递归计算子表达式
-            max_child_depth = 0
-            for attr in ['left', 'right']:
-                if hasattr(node, attr):
-                    child = getattr(node, attr)
-                    if child:
-                        child_depth = self.estimate_expression_depth(child, bit_width)
-                        max_child_depth = max(max_child_depth, child_depth)
-            
-            # 当前操作符深度 + 子表达式最大深度
-            op_depth = 1  # 默认操作符深度为 1
-            return max_child_depth + op_depth
+            # 未知操作符，默认深度 1
+            return (max_child_depth + 1, result_width)
         
         # 三元运算符（MUX）
         elif kind == SyntaxKind.ConditionalExpression:
-            # ?: 运算符，2 选 1 MUX
+            cond_depth, _ = self.estimate_expression_depth(getattr(node, 'condition', None))
+            left_depth, left_width = self.estimate_expression_depth(getattr(node, 'left', None))
+            right_depth, right_width = self.estimate_expression_depth(getattr(node, 'right', None))
+            
             mux_depth = self.rules.get('mux2to1', 1)
+            max_data_depth = max(left_depth, right_depth)
+            result_width = max(left_width, right_width)
             
-            # 递归计算三个操作数
-            max_cond_depth = 0
-            for attr in ['condition', 'left', 'right']:
-                if hasattr(node, attr):
-                    child = getattr(node, attr)
-                    if child:
-                        child_depth = self.estimate_expression_depth(child, bit_width)
-                        max_cond_depth = max(max_cond_depth, child_depth)
-            
-            return max_cond_depth + mux_depth
+            return (max(cond_depth, max_data_depth) + mux_depth, result_width)
         
         # 位选、部分选择（连线类，深度 0）
         elif kind in [SyntaxKind.ElementSelectExpression, SyntaxKind.RangeSelectExpression]:
             base_depth = 0
+            base_width = 32
             if hasattr(node, 'expression'):
-                base_depth = self.estimate_expression_depth(node.expression, bit_width)
-            return base_depth  # 选择操作本身深度为 0
+                base_depth, base_width = self.estimate_expression_depth(node.expression)
+            
+            # 计算选择后的位宽
+            if kind == SyntaxKind.RangeSelectExpression:
+                if hasattr(node, 'left') and hasattr(node, 'right'):
+                    left = self._eval_constant(node.left)
+                    right = self._eval_constant(node.right)
+                    if left is not None and right is not None:
+                        base_width = abs(left - right) + 1
+            
+            return (base_depth, base_width)  # 选择操作本身深度为 0
         
         # 拼接（深度 0）
         elif kind == SyntaxKind.ConcatenationExpression:
             max_child = 0
+            total_width = 0
             if hasattr(node, 'expressions'):
                 try:
                     for expr in node.expressions:
                         if expr:
-                            d = self.estimate_expression_depth(expr, bit_width)
+                            d, w = self.estimate_expression_depth(expr)
                             max_child = max(max_child, d)
+                            total_width += w
                 except:
                     pass
-            return max_child  # 拼接本身深度为 0
+            return (max_child, max(total_width, 1))  # 拼接本身深度为 0
         
         # 一元表达式（取反、负号等）
         elif kind == SyntaxKind.UnaryExpression:
-            child_depth = 0
-            if hasattr(node, 'operand'):
-                child_depth = self.estimate_expression_depth(node.operand, bit_width)
-            return child_depth + 1  # 一元操作符深度为 1
+            child_depth, child_width = self.estimate_expression_depth(getattr(node, 'operand', None))
+            return (child_depth + 1, child_width)  # 一元操作符深度为 1
         
         # 标识符、常量（深度 0）
         elif kind in [SyntaxKind.IdentifierName, SyntaxKind.IntegerLiteral, 
                       SyntaxKind.StringLiteral]:
-            return 0
+            return (0, bit_width)
         
         # 默认：递归子节点
         max_depth = 0
@@ -218,10 +391,12 @@ class LogicDepthEstimator:
             if hasattr(node, attr):
                 child = getattr(node, attr)
                 if child:
-                    d = self.estimate_expression_depth(child, bit_width)
+                    d, w = self.estimate_expression_depth(child)
                     max_depth = max(max_depth, d)
+                    if bit_width is None:
+                        bit_width = w
         
-        return max_depth
+        return (max_depth, bit_width or 32)
     
     def estimate_case_mux_depth(self, case_items_count: int) -> int:
         """估算 case 语句的 MUX 深度（多路选择器）"""
@@ -507,15 +682,131 @@ class RTLAnalyzer:
             "module_depths": {}
         }
         
-        for module_name in self.modules:
-            # 简化处理：对每个模块，估算其内部表达式的最大深度
-            # TODO: 实际应该遍历模块内部的所有表达式
-            result["module_depths"][module_name] = {
-                "estimated_max_depth": 0,  # 待实现完整遍历
-                "bit_width_assumed": 32    # 假设位宽
+        # 遍历所有模块，估算每个模块的逻辑深度
+        for module_name, module_info in self.modules.items():
+            module_result = {
+                "estimated_max_depth": 0,
+                "expressions_analyzed": 0,
+                "bit_width_range": [1, 32]
             }
+            
+            # 在语法树中找到这个模块的节点并分析
+            max_depth, max_width, expr_count = self._analyze_module_expressions(root, module_name)
+            
+            module_result["estimated_max_depth"] = max_depth
+            module_result["expressions_analyzed"] = expr_count
+            module_result["bit_width_range"] = [1, max_width]
+            
+            result["module_depths"][module_name] = module_result
+            
+            if max_depth > result["max_combinational_depth"]:
+                result["max_combinational_depth"] = max_depth
+                result["deepest_path"] = f"{module_name}.<combinational_logic>"
         
         return result
+    
+    def _analyze_module_expressions(self, root, target_module: str) -> Tuple[int, int, int]:
+        """分析模块内所有表达式的逻辑深度"""
+        max_depth = 0
+        max_width = 32
+        expr_count = 0
+        
+        # pyslang 的表达式类型列表
+        EXPR_KINDS = [
+            SyntaxKind.ConditionalExpression,  # ?: 三元运算符
+            SyntaxKind.ConcatenationExpression, # 拼接
+            SyntaxKind.ElementSelectExpression, # 位选
+            SyntaxKind.SimpleRangeSelect,       # 部分选择
+            # 二元运算符
+            SyntaxKind.AddExpression,
+            SyntaxKind.SubtractExpression,
+            SyntaxKind.MultiplyExpression,
+            SyntaxKind.DivideExpression,
+            SyntaxKind.ModExpression,
+            SyntaxKind.BinaryAndExpression,
+            SyntaxKind.BinaryOrExpression,
+            SyntaxKind.BinaryXorExpression,
+            SyntaxKind.BinaryXnorExpression,
+            SyntaxKind.ArithmeticShiftLeftExpression,
+            SyntaxKind.ArithmeticShiftRightExpression,
+            SyntaxKind.LogicalShiftLeftExpression,
+            SyntaxKind.LogicalShiftRightExpression,
+            SyntaxKind.EqualityExpression,
+            SyntaxKind.CaseEqualityExpression,
+            SyntaxKind.CaseInequalityExpression,
+            SyntaxKind.LessThanExpression,
+            SyntaxKind.LessThanEqualExpression,
+            SyntaxKind.GreaterThanExpression,
+            SyntaxKind.GreaterThanEqualExpression,
+            SyntaxKind.LogicalAndExpression,
+            SyntaxKind.LogicalOrExpression,
+            # 一元运算符
+            SyntaxKind.UnaryMinusExpression,
+            SyntaxKind.UnaryPlusExpression,
+            SyntaxKind.UnaryBitwiseNotExpression,
+            SyntaxKind.UnaryBitwiseAndExpression,
+            SyntaxKind.UnaryBitwiseOrExpression,
+            SyntaxKind.UnaryBitwiseXorExpression,
+            SyntaxKind.UnaryBitwiseNorExpression,
+            SyntaxKind.UnaryBitwiseNandExpression,
+            SyntaxKind.UnaryBitwiseXnorExpression,
+            SyntaxKind.UnaryLogicalNotExpression,
+        ]
+        
+        def traverse(node, in_target_module: bool):
+            nonlocal max_depth, max_width, expr_count
+            
+            if not node:
+                return
+            
+            kind = node.kind if hasattr(node, 'kind') else None
+            
+            # 检查是否进入目标模块
+            if kind == SyntaxKind.ModuleDeclaration:
+                name = self._get_name(node)
+                in_target_module = (name == target_module)
+            
+            if in_target_module:
+                # 分析表达式
+                if kind in EXPR_KINDS:
+                    try:
+                        depth, width = self.logic_depth_estimator.estimate_expression_depth(node)
+                        if depth > max_depth:
+                            max_depth = depth
+                        if width > max_width:
+                            max_width = width
+                        expr_count += 1
+                    except Exception as e:
+                        pass  # 跳过分析失败的表达式
+            
+            # 递归遍历
+            for attr in ['members', 'statements', 'items', 'clauses']:
+                if hasattr(node, attr):
+                    val = getattr(node, attr)
+                    if val:
+                        # pyslang 的 items/members 等可能是单个节点或节点列表
+                        # 需要特殊处理
+                        if hasattr(val, '__iter__') and not isinstance(val, str):
+                            try:
+                                # 尝试迭代
+                                items_list = list(val)
+                                for item in items_list:
+                                    if item:
+                                        traverse(item, in_target_module)
+                            except (TypeError, Exception):
+                                # 迭代失败，当作单个节点
+                                traverse(val, in_target_module)
+                        else:
+                            traverse(val, in_target_module)
+            
+            for attr in ['statement', 'body', 'condition', 'elseClause', 'clause']:
+                if hasattr(node, attr):
+                    val = getattr(node, attr)
+                    if val:
+                        traverse(val, in_target_module)
+        
+        traverse(root, False)
+        return (max_depth, max_width, expr_count)
 
 
 def analyze_directory(dirpath: str, analyzer: RTLAnalyzer) -> List[Dict]:
